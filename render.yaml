@@ -1,0 +1,12 @@
+# Render blueprint for the Relay API + WebSocket server.
+# Free tier: no persistent disk, so chat state in DATA_DIR is ephemeral
+# and is wiped on each restart or redeploy. Upgrade to a paid instance
+# and add a `disk:` block if you need state to survive restarts.
+services:
+  - type: web
+    name: relay-server
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz

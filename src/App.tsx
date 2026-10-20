@@ -16,9 +16,12 @@ import {
   WorkflowModal,
 } from './components/Modals.tsx';
 import { CanvasPanel, DetailsPanel, ThreadPanel } from './components/Panels.tsx';
+import { AdminModal, TermsGate } from './components/Admin.tsx';
+import { ListPanel } from './components/Lists.tsx';
+import { canPost, isAdmin, mentionsUser } from './premium.ts';
 
-type Modal = null | 'search' | 'new' | 'profile' | 'plan' | 'scheduled' | 'workflows' | { schedule: string };
-type Panel = null | { kind: 'thread'; id: string } | { kind: 'canvas' } | { kind: 'details' };
+type Modal = null | 'search' | 'new' | 'profile' | 'plan' | 'scheduled' | 'workflows' | 'admin' | { schedule: string };
+type Panel = null | { kind: 'thread'; id: string } | { kind: 'canvas' } | { kind: 'list' } | { kind: 'details' };
 type View = 'channel' | 'saved' | 'mentions';
 
 function Welcome({ onDone }: { onDone: (name: string) => void }) {
@@ -40,7 +43,7 @@ function Welcome({ onDone }: { onDone: (name: string) => void }) {
 
 export default function App() {
   const [identity, setIdentity] = useState(getIdentity);
-  const { snap, typing, error, connected, send, clearError } = useRelay(identity);
+  const { snap, typing, error, analytics, connected, send, clearError } = useRelay(identity);
   const { lastRead, markRead } = useLastRead();
   const unread = useUnread(snap, lastRead);
   const [active, setActive] = useState('general');
@@ -90,7 +93,6 @@ export default function App() {
   const ch = snap.channels[active] ?? snap.channels.general ?? channels[0];
   const typingNow = Object.keys(typing[ch?.id] ?? {}).map((id) => snap.users[id]?.name).filter(Boolean);
   const isMember = ch?.members.includes(snap.me);
-  const mentionTag = `<@${snap.me}>`;
 
   const openChannel = (id: string) => {
     setActive(id);
@@ -98,9 +100,16 @@ export default function App() {
     setPanel(null);
   };
   const openThread = (id: string | null) => setPanel(id ? { kind: 'thread', id } : null);
-  const togglePanel = (kind: 'canvas' | 'details') => setPanel(panel?.kind === kind ? null : { kind });
+  const togglePanel = (kind: 'canvas' | 'list' | 'details') => setPanel(panel?.kind === kind ? null : { kind });
 
-  const ctx = { snap, send, typing, openThread, openChannel };
+  const ctx = { snap, send, typing, openThread, openChannel, analytics };
+  const admin = isAdmin(me);
+  const sectioned = new Set(snap.sections.flatMap((sec) => sec.channelIds));
+  const addSection = () => {
+    const name = prompt('Name the new sidebar section');
+    if (name?.trim()) send({ t: 'sections', sections: [...snap.sections, { id: crypto.randomUUID(), name: name.trim(), channelIds: [] }] });
+  };
+  const removeSection = (id: string) => send({ t: 'sections', sections: snap.sections.filter((sec) => sec.id !== id) });
 
   const dmWith = (userId: string) => {
     const existing = dms.find((d) => d.members.includes(userId));
@@ -112,7 +121,7 @@ export default function App() {
   };
 
   const savedMessages = snap.messages.filter((m) => snap.saved.includes(m.id));
-  const mentionMessages = snap.messages.filter((m) => m.text.includes(mentionTag) && !m.system);
+  const mentionMessages = snap.messages.filter((m) => mentionsUser(m.text, snap.me, snap.groups) && !m.system);
 
   const sidebarItem = (c: (typeof channels)[number]) => {
     const u = unread[c.id];
@@ -138,7 +147,13 @@ export default function App() {
           <button className={`rail-btn ${view === 'saved' ? 'active' : ''}`} title="Saved" onClick={() => setView('saved')}>★</button>
           <button className="rail-btn" title="Workflows" onClick={() => setModal('workflows')}>⚡</button>
           <button className="rail-btn" title="Scheduled" onClick={() => setModal('scheduled')}>⏱{snap.scheduled.length > 0 && <b className="rail-badge">{snap.scheduled.length}</b>}</button>
+          <button className="rail-btn" title="Daily recap (sent to your DM with Relay Bot)" onClick={() => send({ t: 'send', channelId: ch?.id ?? 'general', text: '/recap' })}>📰</button>
           <span className="spacer" />
+          {admin && (
+            <button className="rail-btn" title="Admin console" onClick={() => setModal('admin')}>
+              🛡{(snap.admin?.flags.length ?? 0) > 0 && <b className="rail-badge">{snap.admin?.flags.length}</b>}
+            </button>
+          )}
           <button className="rail-btn" title="Plan" onClick={() => setModal('plan')}>💎</button>
           <button className="rail-me" title="Profile" onClick={() => setModal('profile')}>
             <Avatar user={me} size={34} online={connected} />
@@ -149,14 +164,28 @@ export default function App() {
           <header>
             <h2>{snap.workspace.name}</h2>
             <span className="plan-pill">PREMIUM</span>
+            {me?.role && me.role !== 'member' && <span className="badge">{me.role}</span>}
           </header>
           <button className="search-trigger" onClick={() => setModal('search')}>🔍 Search <kbd>⌘K</kbd></button>
           <div className="side-scroll">
+            {snap.sections.map((sec) => (
+              <div key={sec.id}>
+                <div className="side-section">
+                  <span>{sec.name}</span>
+                  <button title="Remove section (channels move back to Channels)" onClick={() => removeSection(sec.id)}>×</button>
+                </div>
+                {sec.channelIds.map((id) => snap.channels[id]).filter((c) => c && c.members.includes(snap.me)).map(sidebarItem)}
+                {sec.channelIds.length === 0 && <p className="muted small side-hint">Move channels here from a channel's details.</p>}
+              </div>
+            ))}
             <div className="side-section">
               <span>Channels</span>
-              <button title="Create channel" onClick={() => setModal('new')}>＋</button>
+              <span>
+                <button title="New sidebar section" onClick={addSection}>⊞</button>
+                <button title="Create channel" onClick={() => setModal('new')}>＋</button>
+              </span>
             </div>
-            {joined.map(sidebarItem)}
+            {joined.filter((c) => !sectioned.has(c.id)).map(sidebarItem)}
             {browse.length > 0 && <div className="side-section"><span>Browse</span></div>}
             {browse.map(sidebarItem)}
             <div className="side-section"><span>Direct messages</span></div>
@@ -181,7 +210,7 @@ export default function App() {
                 {(view === 'saved' ? savedMessages : mentionMessages).slice().reverse().map((m) => (
                   <button key={m.id} className="feed-item" onClick={() => { openChannel(m.channelId); if (m.threadId) openThread(m.threadId); }}>
                     <small>{snap.users[m.userId]?.name} in {channelLabel(snap.channels[m.channelId], snap.users, snap.me)}</small>
-                    <RichText text={m.text} users={snap.users} />
+                    <RichText text={m.text} users={snap.users} groups={snap.groups} />
                   </button>
                 ))}
               </div>
@@ -196,6 +225,7 @@ export default function App() {
                 <div className="head-actions">
                   <button className="ghost-btn" onClick={() => send({ t: 'huddle', channelId: ch.id, action: 'join' })}>🎧 Huddle</button>
                   <button className={`ghost-btn ${panel?.kind === 'canvas' ? 'on' : ''}`} onClick={() => togglePanel('canvas')}>📄 Canvas</button>
+                  <button className={`ghost-btn ${panel?.kind === 'list' ? 'on' : ''}`} onClick={() => togglePanel('list')}>☑ List</button>
                   <button className="ghost-btn" onClick={() => send({ t: 'send', channelId: ch.id, text: '/summarize' })}>✨ Recap</button>
                   <button className={`ghost-btn ${panel?.kind === 'details' ? 'on' : ''}`} onClick={() => togglePanel('details')}>
                     👥 {ch.members.length}
@@ -212,7 +242,11 @@ export default function App() {
                 <MessageList messages={channelMessages} />
               )}
               <div className="typing">{typingNow.length > 0 && `${typingNow.join(', ')} ${typingNow.length > 1 ? 'are' : 'is'} typing…`}</div>
-              {isMember || ch.kind === 'dm' ? (
+              {(isMember || ch.kind === 'dm') && !canPost(ch, me) ? (
+                <div className="join-bar">
+                  <span>📣 Only admins can post in #{ch.name}. You can still reply in threads.</span>
+                </div>
+              ) : isMember || ch.kind === 'dm' ? (
                 <Composer
                   channelId={ch.id}
                   placeholder={`Message ${ch.kind === 'dm' ? channelLabel(ch, snap.users, snap.me) : '#' + ch.name}`}
@@ -230,6 +264,7 @@ export default function App() {
 
         {panel?.kind === 'thread' && <ThreadPanel parentId={panel.id} onClose={() => setPanel(null)} />}
         {panel?.kind === 'canvas' && ch && <CanvasPanel channelId={ch.id} onClose={() => setPanel(null)} />}
+        {panel?.kind === 'list' && ch && <ListPanel channelId={ch.id} onClose={() => setPanel(null)} />}
         {panel?.kind === 'details' && ch && <DetailsPanel channelId={ch.id} onClose={() => setPanel(null)} />}
       </div>
 
@@ -248,6 +283,8 @@ export default function App() {
       {modal === 'plan' && <PlanModal onClose={() => setModal(null)} />}
       {modal === 'scheduled' && <ScheduledModal onClose={() => setModal(null)} />}
       {modal === 'workflows' && <WorkflowModal onClose={() => setModal(null)} />}
+      {modal === 'admin' && admin && <AdminModal onClose={() => setModal(null)} />}
+      <TermsGate />
       {typeof modal === 'object' && modal && 'schedule' in modal && ch && (
         <SchedulePicker text={modal.schedule} channelId={ch.id} onClose={() => setModal(null)} />
       )}

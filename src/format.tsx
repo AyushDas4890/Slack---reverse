@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import type { Channel, User } from './types.ts';
+import type { Channel, User, UserGroup } from './types.ts';
 
 export const EMOJI = ['👍', '❤️', '😂', '🎉', '🙏', '👀', '🔥', '✅', '🚀', '😮', '😢', '💯'];
 
@@ -31,9 +31,9 @@ export function channelLabel(ch: Channel, users: Record<string, User>, me: strin
   return users[other]?.name ?? 'Unknown';
 }
 
-const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(_[^_\n]+_)|(~[^~\n]+~)|(<@[\w-]+>)|(https?:\/\/[^\s<]+)|(#[a-z0-9_-]+)/gi;
+const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(_[^_\n]+_)|(~[^~\n]+~)|(<@[\w-]+>)|(<!g:[\w-]+>)|(https?:\/\/[^\s<]+)|(#[a-z0-9_-]+)/gi;
 
-function inline(text: string, users: Record<string, User>, keyBase: string): ReactNode[] {
+function inline(text: string, users: Record<string, User>, keyBase: string, groups: UserGroup[] = []): ReactNode[] {
   const out: ReactNode[] = [];
   let last = 0;
   let i = 0;
@@ -46,7 +46,14 @@ function inline(text: string, users: Record<string, User>, keyBase: string): Rea
     else if (tok.startsWith('**')) out.push(<strong key={key}>{tok.slice(2, -2)}</strong>);
     else if (tok.startsWith('_')) out.push(<em key={key}>{tok.slice(1, -1)}</em>);
     else if (tok.startsWith('~')) out.push(<s key={key}>{tok.slice(1, -1)}</s>);
-    else if (tok.startsWith('<@')) {
+    else if (tok.startsWith('<!g:')) {
+      const id = tok.slice(4, -1);
+      out.push(
+        <span key={key} className="mention group">
+          @{groups.find((g) => g.id === id)?.handle ?? 'group'}
+        </span>,
+      );
+    } else if (tok.startsWith('<@')) {
       const id = tok.slice(2, -1);
       out.push(
         <span key={key} className="mention">
@@ -66,7 +73,7 @@ function inline(text: string, users: Record<string, User>, keyBase: string): Rea
   return out;
 }
 
-export function RichText({ text, users }: { text: string; users: Record<string, User> }) {
+export function RichText({ text, users, groups }: { text: string; users: Record<string, User>; groups?: UserGroup[] }) {
   const parts = text.split(/```/);
   return (
     <>
@@ -84,9 +91,9 @@ export function RichText({ text, users }: { text: string; users: Record<string, 
               <span key={li}>
                 {li > 0 && <br />}
                 {line.startsWith('> ') ? (
-                  <span className="quote">{inline(line.slice(2), users, `${idx}-${li}`)}</span>
+                  <span className="quote">{inline(line.slice(2), users, `${idx}-${li}`, groups)}</span>
                 ) : (
-                  inline(line, users, `${idx}-${li}`)
+                  inline(line, users, `${idx}-${li}`, groups)
                 )}
               </span>
             ))}

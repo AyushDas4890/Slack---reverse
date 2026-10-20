@@ -3,6 +3,8 @@ export interface UserStatus {
   text: string;
 }
 
+export type Role = 'owner' | 'admin' | 'member' | 'guest';
+
 export interface User {
   id: string;
   name: string;
@@ -10,6 +12,7 @@ export interface User {
   title: string;
   status: UserStatus;
   bot?: boolean;
+  role?: Role;
 }
 
 export type ChannelKind = 'public' | 'private' | 'dm';
@@ -21,6 +24,7 @@ export interface Channel {
   kind: ChannelKind;
   members: string[];
   createdAt: number;
+  postingPolicy?: 'everyone' | 'admins';
 }
 
 export interface FileAttachment {
@@ -50,6 +54,60 @@ export interface Workflow {
   enabled: boolean;
   trigger: { type: 'keyword'; keyword: string; channelId: string | 'any' } | { type: 'join'; channelId: string };
   reply: string;
+  branch?: { contains: string; reply: string };
+}
+
+export interface ListItem {
+  id: string;
+  title: string;
+  done: boolean;
+  assignee: string;
+  due: string;
+  status: 'todo' | 'doing' | 'done';
+}
+
+export interface Section {
+  id: string;
+  name: string;
+  channelIds: string[];
+}
+
+export interface UserGroup {
+  id: string;
+  handle: string;
+  name: string;
+  members: string[];
+}
+
+export interface Flag {
+  id: string;
+  messageId: string;
+  channelId: string;
+  by: string;
+  reason: string;
+  ts: number;
+  excerpt: string;
+}
+
+export interface AuditEntry {
+  ts: number;
+  actor: string;
+  action: string;
+  detail: string;
+}
+
+export interface Settings {
+  retentionDays: number;
+  terms: string;
+  termsVersion: number;
+  barriers: [string, string][];
+}
+
+export interface AdminData {
+  flags: Flag[];
+  audit: AuditEntry[];
+  legalHolds: string[];
+  preservedCount: number;
 }
 
 export interface Scheduled {
@@ -76,6 +134,14 @@ export const PLAN_FEATURES = [
   'Unlimited file uploads',
   'Private channels and guest access',
   'Advanced search and saved items',
+  'Lists, custom sidebar sections, and user groups',
+  'Audio and screen clips, huddle notes',
+  'Daily recaps, /explain, file summaries, search answers',
+  'Conditional branching and workflow templates',
+  'Roles, guests, and channel posting permissions',
+  'Admin analytics, audit logs, and full data exports',
+  'Retention policies, legal holds, and flagged content review',
+  'Information barriers and custom terms of service',
 ] as const;
 
 export interface Snapshot {
@@ -90,6 +156,12 @@ export interface Snapshot {
   scheduled: Scheduled[];
   huddles: HuddleState[];
   saved: string[];
+  lists: Record<string, ListItem[]>;
+  sections: Section[];
+  groups: UserGroup[];
+  settings: Settings;
+  termsAccepted: number;
+  admin?: AdminData;
 }
 
 export type ClientEvent =
@@ -110,7 +182,21 @@ export type ClientEvent =
   | { t: 'workflows'; list: Workflow[] }
   | { t: 'schedule'; channelId: string; text: string; at: number }
   | { t: 'unschedule'; id: string }
-  | { t: 'huddle'; channelId: string; action: 'join' | 'leave' };
+  | { t: 'huddle'; channelId: string; action: 'join' | 'leave' }
+  | { t: 'list'; channelId: string; items: ListItem[] }
+  | { t: 'sections'; sections: Section[] }
+  | { t: 'groups'; groups: UserGroup[] }
+  | { t: 'flag'; id: string; reason: string }
+  | { t: 'resolveFlag'; id: string; removeMessage: boolean }
+  | { t: 'role'; userId: string; role: Role }
+  | { t: 'channelPolicy'; channelId: string; postingPolicy: 'everyone' | 'admins' }
+  | { t: 'addMember'; channelId: string; userId: string }
+  | { t: 'settings'; settings: Omit<Settings, 'termsVersion'> }
+  | { t: 'legalHold'; userId: string; on: boolean }
+  | { t: 'acceptTerms' }
+  | { t: 'fileSummary'; id: string; index: number }
+  | { t: 'analytics' }
+  | { t: 'export' };
 
 export type ServerEvent =
   | { t: 'init'; snapshot: Snapshot }
@@ -125,4 +211,22 @@ export type ServerEvent =
   | { t: 'typing'; channelId: string; userId: string }
   | { t: 'huddles'; huddles: HuddleState[] }
   | { t: 'saved'; saved: string[] }
+  | { t: 'lists'; channelId: string; items: ListItem[] }
+  | { t: 'sections'; sections: Section[] }
+  | { t: 'groups'; groups: UserGroup[] }
+  | { t: 'settings'; settings: Settings }
+  | { t: 'termsAccepted'; version: number }
+  | { t: 'admin'; admin: AdminData }
+  | { t: 'analytics'; data: Analytics }
+  | { t: 'export'; data: unknown }
   | { t: 'error'; message: string };
+
+export interface Analytics {
+  totalMessages: number;
+  activeUsers7d: number;
+  messagesByDay: { day: string; count: number }[];
+  topChannels: { channelId: string; name: string; count: number }[];
+  topPosters: { userId: string; name: string; count: number }[];
+  filesShared: number;
+  reactions: number;
+}

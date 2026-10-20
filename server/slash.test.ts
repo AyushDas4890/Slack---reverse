@@ -17,3 +17,9 @@ test('remind without duration gives usage', () => {
 test('shrug appends emoticon', () => {
   assert.deepEqual(parseSlash('/shrug meh'), { kind: 'say', text: 'meh ¯\\_(ツ)_/¯' });
 });
+
+test('recap and explain parse', () => {
+  assert.deepEqual(parseSlash('/recap'), { kind: 'recap' });
+  assert.deepEqual(parseSlash('/explain SLO'), { kind: 'explain', term: 'SLO' });
+  assert.equal(parseSlash('/explain')?.kind, 'usage');
+});

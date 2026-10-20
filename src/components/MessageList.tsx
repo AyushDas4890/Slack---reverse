@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Message } from '../types.ts';
 import { useRelayCtx } from '../ctx.ts';
 import { dayLabel, EMOJI, RichText, timeLabel } from '../format.tsx';
+import { isAdmin } from '../premium.ts';
 import { Avatar } from './Avatar.tsx';
 
 export function MessageRow({ m, compact, inThread }: { m: Message; compact: boolean; inThread?: boolean }) {
@@ -11,13 +12,14 @@ export function MessageRow({ m, compact, inThread }: { m: Message; compact: bool
   const [picker, setPicker] = useState(false);
   const user = snap.users[m.userId];
   const mine = m.userId === snap.me;
+  const canModerate = isAdmin(snap.users[snap.me]);
   const replies = inThread ? [] : snap.messages.filter((x) => x.threadId === m.id);
   const saved = snap.saved.includes(m.id);
 
   if (m.system) {
     return (
       <div className="msg system">
-        <RichText text={m.text} users={snap.users} />
+        <RichText text={m.text} users={snap.users} groups={snap.groups} />
       </div>
     );
   }
@@ -47,16 +49,23 @@ export function MessageRow({ m, compact, inThread }: { m: Message; compact: bool
           </div>
         ) : (
           <div className="text">
-            <RichText text={m.text} users={snap.users} />
+            <RichText text={m.text} users={snap.users} groups={snap.groups} />
           </div>
         )}
         {m.files?.map((f, i) =>
           f.type.startsWith('image/') ? (
             <img key={i} className="attach-img" src={f.dataUrl} alt={f.name} />
+          ) : f.type.startsWith('video/') ? (
+            <video key={i} className="attach-img" src={f.dataUrl} controls />
+          ) : f.type.startsWith('audio/') ? (
+            <audio key={i} className="attach-audio" src={f.dataUrl} controls />
           ) : (
-            <a key={i} className="attach-file" href={f.dataUrl} download={f.name}>
-              📄 {f.name} <small>{Math.ceil(f.size / 1024)} KB</small>
-            </a>
+            <div key={i} className="attach-row">
+              <a className="attach-file" href={f.dataUrl} download={f.name}>
+                📄 {f.name} <small>{Math.ceil(f.size / 1024)} KB</small>
+              </a>
+              <button className="ghost-btn" title="Summarize this file" onClick={() => send({ t: 'fileSummary', id: m.id, index: i })}>✨ Summarize</button>
+            </div>
           ),
         )}
         {Object.keys(m.reactions).length > 0 && (
@@ -86,7 +95,18 @@ export function MessageRow({ m, compact, inThread }: { m: Message; compact: bool
         <button title={m.pinned ? 'Unpin' : 'Pin'} onClick={() => send({ t: 'pin', id: m.id })}>📌</button>
         <button title={saved ? 'Unsave' : 'Save for later'} onClick={() => send({ t: 'save', id: m.id })}>{saved ? '★' : '☆'}</button>
         {mine && <button title="Edit" onClick={() => { setDraft(m.text); setEditing(true); }}>✎</button>}
-        {mine && <button title="Delete" onClick={() => { if (confirm('Delete this message?')) send({ t: 'delete', id: m.id }); }}>🗑</button>}
+        {(mine || canModerate) && <button title="Delete" onClick={() => { if (confirm('Delete this message?')) send({ t: 'delete', id: m.id }); }}>🗑</button>}
+        {!mine && (
+          <button
+            title="Flag for admin review"
+            onClick={() => {
+              const reason = prompt('Why are you flagging this message?');
+              if (reason?.trim()) send({ t: 'flag', id: m.id, reason: reason.trim() });
+            }}
+          >
+            🚩
+          </button>
+        )}
         {picker && (
           <div className="popover emoji-pop">
             {EMOJI.map((e) => (

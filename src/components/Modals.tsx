@@ -3,6 +3,7 @@ import { PLAN_FEATURES } from '../types.ts';
 import type { Workflow } from '../types.ts';
 import { useRelayCtx } from '../ctx.ts';
 import { channelLabel, timeLabel } from '../format.tsx';
+import { searchAnswer, WORKFLOW_TEMPLATES } from '../premium.ts';
 
 export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: React.ReactNode; wide?: boolean }) {
   useEffect(() => {
@@ -41,7 +42,8 @@ export function SearchPalette({ onClose, onPick }: { onClose: () => void; onPick
           .slice(-8)
           .reverse()
       : [];
-    return { channels, messages };
+    const answer = /\?\s*$/.test(q) ? searchAnswer(q, snap.messages) : null;
+    return { channels, messages, answer };
   }, [q, snap]);
 
   return (
@@ -50,11 +52,20 @@ export function SearchPalette({ onClose, onPick }: { onClose: () => void; onPick
         <input
           ref={inputRef}
           value={q}
-          placeholder="Search channels, people, and messages…"
+          placeholder="Search, or ask a question ending in ?"
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => e.key === 'Escape' && onClose()}
         />
         <div className="palette-results">
+          {results.answer && (
+            <button className="answer" onClick={() => onPick(results.answer!.channelId, results.answer!.threadId ?? results.answer!.id)}>
+              <span>✨</span>
+              <div>
+                <strong>Best answer</strong> from {snap.users[results.answer.userId]?.name} in {channelLabel(snap.channels[results.answer.channelId], snap.users, snap.me)}
+                <small>{results.answer.text.slice(0, 200)}</small>
+              </div>
+            </button>
+          )}
           {results.channels.map(({ c, label }) => (
             <button key={c.id} onClick={() => onPick(c.id)}>
               <span>{c.kind === 'dm' ? '●' : c.kind === 'private' ? '🔒' : '#'}</span> {label}
@@ -227,10 +238,37 @@ export function WorkflowModal({ onClose }: { onClose: () => void }) {
             </select>
           </div>
           <textarea value={w.reply} onChange={(e) => patch(w.id, (x) => ({ ...x, reply: e.target.value }))} placeholder="Bot reply" />
+          {w.trigger.type === 'keyword' && (
+            w.branch ? (
+              <div className="branch">
+                <div className="row">
+                  <span>Otherwise, if the message also contains</span>
+                  <input className="grow" value={w.branch.contains} onChange={(e) => patch(w.id, (x) => ({ ...x, branch: { ...x.branch!, contains: e.target.value } }))} />
+                  <button className="ghost-btn danger" onClick={() => patch(w.id, (x) => ({ ...x, branch: undefined }))}>Remove branch</button>
+                </div>
+                <textarea value={w.branch.reply} onChange={(e) => patch(w.id, (x) => ({ ...x, branch: { ...x.branch!, reply: e.target.value } }))} placeholder="Reply for this branch" />
+              </div>
+            ) : (
+              <button className="ghost-btn fit" onClick={() => patch(w.id, (x) => ({ ...x, branch: { contains: 'urgent', reply: 'Escalating this now.' } }))}>
+                ＋ Add condition
+              </button>
+            )
+          )}
         </div>
       ))}
       <div className="row">
         <button className="ghost-btn" onClick={add}>＋ Add workflow</button>
+        <select
+          className="fit"
+          value=""
+          onChange={(e) => {
+            const tpl = WORKFLOW_TEMPLATES[Number(e.target.value)];
+            if (tpl) setList([...list, { ...tpl, id: crypto.randomUUID() }]);
+          }}
+        >
+          <option value="">Start from a template…</option>
+          {WORKFLOW_TEMPLATES.map((tpl, i) => <option key={tpl.name} value={i}>{tpl.name}</option>)}
+        </select>
         <span className="spacer" />
         <button className="send-btn" onClick={() => { send({ t: 'workflows', list }); onClose(); }}>Publish</button>
       </div>

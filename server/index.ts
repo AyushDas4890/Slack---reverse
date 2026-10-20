@@ -5,21 +5,40 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import type {
+  AdminData,
+  AuditEntry,
   Channel,
   ClientEvent,
+  Flag,
   HuddleState,
+  ListItem,
   Message,
   Scheduled,
+  Section,
   ServerEvent,
+  Settings,
   Snapshot,
   User,
+  UserGroup,
   Workflow,
 } from '../src/types.ts';
+import {
+  barred,
+  canPost,
+  computeAnalytics,
+  dailyRecap,
+  explainTerm,
+  huddleNote,
+  isAdmin,
+  pruneRetention,
+  summarizeText,
+  workflowReply,
+} from '../src/premium.ts';
 import { parseSlash } from './slash.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dataDir = path.join(root, 'data');
+const dataDir = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(root, 'data');
 const dataFile = path.join(dataDir, 'db.json');
 const distDir = path.join(root, 'dist');
 
@@ -35,7 +54,19 @@ interface DB {
   workflows: Workflow[];
   scheduled: Scheduled[];
   saved: Record<string, string[]>;
+  lists: Record<string, ListItem[]>;
+  sections: Record<string, Section[]>;
+  groups: UserGroup[];
+  settings: Settings;
+  termsAccepted: Record<string, number>;
+  flags: Flag[];
+  audit: AuditEntry[];
+  legalHolds: string[];
+  preserved: Message[];
 }
+
+const DEFAULT_SETTINGS: Settings = { retentionDays: 0, terms: '', termsVersion: 0, barriers: [] };
+const MAX_AUDIT = 1000;
 
 function seed(): DB {
   const now = Date.now();
@@ -88,6 +119,15 @@ function seed(): DB {
     ],
     scheduled: [],
     saved: {},
+    lists: {},
+    sections: {},
+    groups: [],
+    settings: { ...DEFAULT_SETTINGS },
+    termsAccepted: {},
+    flags: [],
+    audit: [],
+    legalHolds: [],
+    preserved: [],
   };
   db.messages.push({
     id: randomUUID(),
@@ -103,7 +143,24 @@ function seed(): DB {
 function load(): DB {
   if (!fs.existsSync(dataFile)) return seed();
   const raw = fs.readFileSync(dataFile, 'utf8');
-  return JSON.parse(raw) as DB;
+  const stored = JSON.parse(raw) as Partial<DB> & Pick<DB, 'users' | 'channels' | 'messages'>;
+  // Databases written before the premium features lack these fields.
+  return {
+    canvases: {},
+    workflows: [],
+    scheduled: [],
+    saved: {},
+    lists: {},
+    sections: {},
+    groups: [],
+    termsAccepted: {},
+    flags: [],
+    audit: [],
+    legalHolds: [],
+    preserved: [],
+    ...stored,
+    settings: { ...DEFAULT_SETTINGS, ...stored.settings },
+  };
 }
 
 const db = load();
@@ -135,7 +192,32 @@ function broadcast(ev: ServerEvent, filter?: (userId: string) => boolean): void 
 }
 
 function canSee(ch: Channel, userId: string): boolean {
+  if (db.users[userId]?.role === 'guest') return ch.members.includes(userId);
   return ch.kind === 'public' || ch.members.includes(userId);
+}
+
+function adminData(): AdminData {
+  return { flags: db.flags, audit: db.audit.slice(-200), legalHolds: db.legalHolds, preservedCount: db.preserved.length };
+}
+
+function broadcastAdmin(): void {
+  broadcast({ t: 'admin', admin: adminData() }, (uid) => isAdmin(db.users[uid]));
+}
+
+function audit(actor: string, action: string, detail: string): void {
+  db.audit.push({ ts: Date.now(), actor, action, detail });
+  if (db.audit.length > MAX_AUDIT) db.audit = db.audit.slice(-MAX_AUDIT);
+  broadcastAdmin();
+}
+
+function preserve(m: Message): void {
+  if (!db.legalHolds.includes(m.userId)) return;
+  db.preserved.push({ ...m, reactions: { ...m.reactions } });
+  broadcastAdmin();
+}
+
+function resendInit(userId: string): void {
+  for (const [ws, uid] of clients) if (uid === userId) send(ws, { t: 'init', snapshot: snapshotFor(userId) });
 }
 
 function broadcastChannel(ch: Channel, ev: ServerEvent): void {
@@ -168,6 +250,12 @@ function snapshotFor(userId: string): Snapshot {
     scheduled: db.scheduled.filter((s) => s.userId === userId),
     huddles: huddleList(),
     saved: db.saved[userId] ?? [],
+    lists: Object.fromEntries(Object.entries(db.lists).filter(([cid]) => visibleChannels[cid])),
+    sections: db.sections[userId] ?? [],
+    groups: db.groups,
+    settings: db.settings,
+    termsAccepted: db.termsAccepted[userId] ?? 0,
+    admin: isAdmin(db.users[userId]) ? adminData() : undefined,
   };
 }
 
@@ -202,7 +290,7 @@ function runWorkflows(message: Message): void {
     const { keyword, channelId } = wf.trigger;
     if (channelId !== 'any' && channelId !== message.channelId) continue;
     if (!message.text.toLowerCase().includes(keyword.toLowerCase())) continue;
-    postMessage(message.channelId, BOT_ID, wf.reply, { threadId: message.threadId ?? message.id });
+    postMessage(message.channelId, BOT_ID, workflowReply(wf, message.text), { threadId: message.threadId ?? message.id });
   }
 }
 
@@ -246,10 +334,14 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
         color: COLORS[Object.keys(db.users).length % COLORS.length],
         title: '',
         status: { emoji: '', text: '' },
+        role: 'member',
       };
       db.users[userId] = user;
       for (const id of ['general', 'random']) ensureMember(db.channels[id], userId);
     }
+    // The first person to sign in owns the workspace; older databases get an owner the same way.
+    if (!Object.values(db.users).some((u) => u.role === 'owner')) user.role = 'owner';
+    user.role ??= 'member';
     clients.set(ws, userId);
     send(ws, { t: 'init', snapshot: snapshotFor(userId) });
     broadcast({ t: 'user', user });
@@ -269,6 +361,15 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
     case 'send': {
       const ch = db.channels[ev.channelId];
       if (!ch || !canSee(ch, userId)) return;
+      if (!canPost(ch, db.users[userId])) {
+        send(ws, { t: 'error', message: `Only admins can post in #${ch.name}` });
+        return;
+      }
+      const other = ch.kind === 'dm' ? ch.members.find((u) => u !== userId) : undefined;
+      if (other && barred(userId, other, db.groups, db.settings.barriers)) {
+        send(ws, { t: 'error', message: 'An information barrier blocks messages between you two.' });
+        return;
+      }
       ensureMember(ch, userId);
       const slash = parseSlash(ev.text);
       if (slash) {
@@ -292,6 +393,13 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
           toggleHuddle(ch.id, userId, 'join');
         } else if (slash.kind === 'summarize') {
           postMessage(ch.id, BOT_ID, summarize(ch.id, ev.threadId), { threadId: ev.threadId });
+        } else if (slash.kind === 'recap') {
+          const dm = openDM(userId, BOT_ID);
+          const visible = db.messages.filter((m) => db.channels[m.channelId] && canSee(db.channels[m.channelId], userId));
+          postMessage(dm.id, BOT_ID, dailyRecap(visible, db.channels, db.users, Date.now() - 86_400_000, BOT_ID));
+        } else if (slash.kind === 'explain') {
+          const visible = db.messages.filter((m) => db.channels[m.channelId] && canSee(db.channels[m.channelId], userId));
+          postMessage(ch.id, BOT_ID, explainTerm(slash.term, visible, db.users), { system: true, threadId: ev.threadId });
         } else if (slash.kind === 'usage') {
           postMessage(ev.channelId, BOT_ID, slash.text, { system: true, threadId: ev.threadId });
         } else {
@@ -306,6 +414,7 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
     case 'edit': {
       const m = db.messages.find((x) => x.id === ev.id);
       if (!m || m.userId !== userId) return;
+      preserve(m);
       m.text = ev.text.slice(0, MAX_TEXT);
       m.edited = true;
       const ch = db.channels[m.channelId];
@@ -316,8 +425,10 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
     case 'delete': {
       const idx = db.messages.findIndex((x) => x.id === ev.id);
       const m = db.messages[idx];
-      if (!m || m.userId !== userId) return;
+      if (!m || (m.userId !== userId && !isAdmin(db.users[userId]))) return;
+      for (const x of db.messages) if (x.id === ev.id || x.threadId === ev.id) preserve(x);
       db.messages = db.messages.filter((x) => x.id !== ev.id && x.threadId !== ev.id);
+      if (m.userId !== userId) audit(userId, 'message.delete', `Removed a message by ${db.users[m.userId]?.name ?? m.userId}`);
       const ch = db.channels[m.channelId];
       if (ch) broadcastChannel(ch, { t: 'messageDeleted', id: m.id });
       persist();
@@ -370,12 +481,13 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
       };
       db.channels[ch.id] = ch;
       broadcastChannel(ch, { t: 'channel', channel: ch });
+      audit(userId, 'channel.create', `${ch.kind} #${ch.name}`);
       persist();
       return;
     }
     case 'join': {
       const ch = db.channels[ev.channelId];
-      if (!ch || ch.kind !== 'public') return;
+      if (!ch || ch.kind !== 'public' || !canSee(ch, userId)) return;
       ensureMember(ch, userId);
       broadcastChannel(ch, { t: 'channel', channel: ch });
       postMessage(ch.id, BOT_ID, `<@${userId}> joined the channel.`, { system: true });
@@ -392,6 +504,10 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
     }
     case 'openDM': {
       if (!db.users[ev.userId]) return;
+      if (barred(userId, ev.userId, db.groups, db.settings.barriers)) {
+        send(ws, { t: 'error', message: 'An information barrier blocks DMs with this person.' });
+        return;
+      }
       openDM(userId, ev.userId);
       return;
     }
@@ -419,8 +535,10 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
       return;
     }
     case 'workflows': {
+      if (db.users[userId]?.role === 'guest') return;
       db.workflows = ev.list.slice(0, 50).map((w) => ({ ...w, id: w.id || randomUUID() }));
       broadcast({ t: 'workflows', list: db.workflows });
+      audit(userId, 'workflows.publish', `${db.workflows.length} workflows`);
       persist();
       return;
     }
@@ -441,18 +559,224 @@ function handle(ws: WebSocket, ev: ClientEvent): void {
     case 'huddle': {
       const ch = db.channels[ev.channelId];
       if (!ch || !canSee(ch, userId)) return;
+      const other = ch.kind === 'dm' ? ch.members.find((u) => u !== userId) : undefined;
+      if (ev.action === 'join' && other && barred(userId, other, db.groups, db.settings.barriers)) {
+        send(ws, { t: 'error', message: 'An information barrier blocks huddles between you two.' });
+        return;
+      }
       toggleHuddle(ch.id, userId, ev.action);
+      return;
+    }
+    case 'list': {
+      const ch = db.channels[ev.channelId];
+      if (!ch || !canSee(ch, userId)) return;
+      db.lists[ch.id] = ev.items.slice(0, 500).map((it) => ({
+        id: it.id || randomUUID(),
+        title: String(it.title).slice(0, 200),
+        done: it.status === 'done',
+        assignee: db.users[it.assignee] ? it.assignee : '',
+        due: String(it.due).slice(0, 10),
+        status: it.status === 'doing' || it.status === 'done' ? it.status : 'todo',
+      }));
+      broadcastChannel(ch, { t: 'lists', channelId: ch.id, items: db.lists[ch.id] });
+      persist();
+      return;
+    }
+    case 'sections': {
+      db.sections[userId] = ev.sections.slice(0, 30).map((sec) => ({
+        id: sec.id || randomUUID(),
+        name: String(sec.name).slice(0, 40) || 'Section',
+        channelIds: sec.channelIds.filter((cid) => db.channels[cid]),
+      }));
+      send(ws, { t: 'sections', sections: db.sections[userId] });
+      persist();
+      return;
+    }
+    case 'groups': {
+      if (!isAdmin(db.users[userId])) return;
+      db.groups = ev.groups.slice(0, 100).map((g) => ({
+        id: g.id || randomUUID(),
+        handle: g.handle.toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 30) || 'group',
+        name: String(g.name).slice(0, 60),
+        members: g.members.filter((u) => db.users[u]),
+      }));
+      broadcast({ t: 'groups', groups: db.groups });
+      audit(userId, 'groups.update', `${db.groups.length} user groups`);
+      persist();
+      return;
+    }
+    case 'flag': {
+      const m = db.messages.find((x) => x.id === ev.id);
+      if (!m || !db.channels[m.channelId] || !canSee(db.channels[m.channelId], userId)) return;
+      db.flags.push({
+        id: randomUUID(),
+        messageId: m.id,
+        channelId: m.channelId,
+        by: userId,
+        reason: ev.reason.slice(0, 200),
+        ts: Date.now(),
+        excerpt: m.text.slice(0, 200),
+      });
+      audit(userId, 'message.flag', ev.reason.slice(0, 80));
+      persist();
+      return;
+    }
+    case 'resolveFlag': {
+      if (!isAdmin(db.users[userId])) return;
+      const flag = db.flags.find((f) => f.id === ev.id);
+      if (!flag) return;
+      db.flags = db.flags.filter((f) => f.id !== ev.id);
+      if (ev.removeMessage) {
+        const m = db.messages.find((x) => x.id === flag.messageId);
+        if (m) {
+          preserve(m);
+          db.messages = db.messages.filter((x) => x.id !== m.id && x.threadId !== m.id);
+          const ch = db.channels[m.channelId];
+          if (ch) broadcastChannel(ch, { t: 'messageDeleted', id: m.id });
+        }
+      }
+      audit(userId, 'flag.resolve', ev.removeMessage ? 'Removed flagged message' : 'Dismissed flag');
+      persist();
+      return;
+    }
+    case 'role': {
+      const actor = db.users[userId];
+      const target = db.users[ev.userId];
+      if (!isAdmin(actor) || !target || target.bot) return;
+      // Only owners can grant or revoke admin rights, and nobody can demote the last owner.
+      if ((ev.role === 'owner' || target.role === 'owner' || target.role === 'admin' || ev.role === 'admin') && actor?.role !== 'owner') {
+        send(ws, { t: 'error', message: 'Only an owner can change admin or owner roles.' });
+        return;
+      }
+      const owners = Object.values(db.users).filter((u) => u.role === 'owner');
+      if (target.role === 'owner' && ev.role !== 'owner' && owners.length === 1) {
+        send(ws, { t: 'error', message: 'The workspace needs at least one owner.' });
+        return;
+      }
+      target.role = ev.role;
+      broadcast({ t: 'user', user: target });
+      audit(userId, 'user.role', `${target.name} → ${ev.role}`);
+      resendInit(target.id);
+      persist();
+      return;
+    }
+    case 'channelPolicy': {
+      const ch = db.channels[ev.channelId];
+      if (!ch || ch.kind === 'dm' || !isAdmin(db.users[userId])) return;
+      ch.postingPolicy = ev.postingPolicy === 'admins' ? 'admins' : 'everyone';
+      broadcastChannel(ch, { t: 'channel', channel: ch });
+      audit(userId, 'channel.policy', `#${ch.name}: ${ch.postingPolicy} can post`);
+      persist();
+      return;
+    }
+    case 'addMember': {
+      const ch = db.channels[ev.channelId];
+      if (!ch || ch.kind === 'dm' || !db.users[ev.userId] || !ch.members.includes(userId)) return;
+      if (db.users[ev.userId].role === 'guest' && !isAdmin(db.users[userId])) {
+        send(ws, { t: 'error', message: 'Only admins can add guests to channels.' });
+        return;
+      }
+      ensureMember(ch, ev.userId);
+      broadcastChannel(ch, { t: 'channel', channel: ch });
+      resendInit(ev.userId);
+      postMessage(ch.id, BOT_ID, `<@${userId}> added <@${ev.userId}>.`, { system: true });
+      audit(userId, 'channel.addMember', `${db.users[ev.userId].name} → #${ch.name}`);
+      return;
+    }
+    case 'settings': {
+      if (!isAdmin(db.users[userId])) return;
+      const terms = ev.settings.terms.slice(0, 20_000);
+      db.settings = {
+        retentionDays: Math.max(0, Math.min(3650, Math.floor(ev.settings.retentionDays) || 0)),
+        terms,
+        termsVersion: terms !== db.settings.terms ? db.settings.termsVersion + 1 : db.settings.termsVersion,
+        barriers: ev.settings.barriers.filter(([a, b]) => a !== b && db.groups.some((g) => g.id === a) && db.groups.some((g) => g.id === b)),
+      };
+      broadcast({ t: 'settings', settings: db.settings });
+      audit(userId, 'settings.update', `retention ${db.settings.retentionDays || '∞'}d, ${db.settings.barriers.length} barriers, terms v${db.settings.termsVersion}`);
+      applyRetention();
+      persist();
+      return;
+    }
+    case 'legalHold': {
+      if (!isAdmin(db.users[userId]) || !db.users[ev.userId]) return;
+      db.legalHolds = ev.on ? [...new Set([...db.legalHolds, ev.userId])] : db.legalHolds.filter((u) => u !== ev.userId);
+      audit(userId, ev.on ? 'legalHold.place' : 'legalHold.release', db.users[ev.userId].name);
+      persist();
+      return;
+    }
+    case 'acceptTerms': {
+      db.termsAccepted[userId] = db.settings.termsVersion;
+      send(ws, { t: 'termsAccepted', version: db.settings.termsVersion });
+      persist();
+      return;
+    }
+    case 'fileSummary': {
+      const m = db.messages.find((x) => x.id === ev.id);
+      const file = m?.files?.[ev.index];
+      if (!m || !file || !canSee(db.channels[m.channelId], userId)) return;
+      const isText = /^text\/|json|xml|csv|markdown|javascript/.test(file.type) || /\.(md|txt|csv|json|log|ts|js|py)$/i.test(file.name);
+      if (!isText) {
+        send(ws, { t: 'error', message: `Can't summarize ${file.name}: only text files are supported.` });
+        return;
+      }
+      const base64 = file.dataUrl.slice(file.dataUrl.indexOf(',') + 1);
+      const text = Buffer.from(base64, 'base64').toString('utf8');
+      postMessage(m.channelId, BOT_ID, `**Summary of ${file.name}**\n${summarizeText(text)}`, { threadId: m.threadId ?? m.id });
+      return;
+    }
+    case 'analytics': {
+      if (!isAdmin(db.users[userId])) return;
+      send(ws, { t: 'analytics', data: computeAnalytics(db.messages, db.channels, db.users, Date.now()) });
+      return;
+    }
+    case 'export': {
+      if (!isAdmin(db.users[userId])) return;
+      audit(userId, 'data.export', 'Full workspace export');
+      const { users, channels, messages, canvases, lists, groups, preserved } = db;
+      send(ws, { t: 'export', data: { exportedAt: new Date().toISOString(), users, channels, messages, canvases, lists, groups, preserved } });
       return;
     }
   }
 }
+
+function applyRetention(): void {
+  const { kept, removed } = pruneRetention(db.messages, db.settings.retentionDays, db.legalHolds, Date.now());
+  if (removed === 0) return;
+  const keptIds = new Set(kept.map((m) => m.id));
+  const gone = db.messages.filter((m) => !keptIds.has(m.id));
+  db.messages = kept;
+  for (const m of gone) {
+    const ch = db.channels[m.channelId];
+    if (ch) broadcastChannel(ch, { t: 'messageDeleted', id: m.id });
+  }
+  audit('system', 'retention.prune', `Deleted ${removed} messages older than ${db.settings.retentionDays} days`);
+  persist();
+}
+
+const huddleSessions = new Map<string, { startedAt: number; everyone: Set<string> }>();
 
 function toggleHuddle(channelId: string, userId: string, action: 'join' | 'leave'): void {
   const set = huddles.get(channelId) ?? new Set<string>();
   if (action === 'join') set.add(userId);
   else set.delete(userId);
   huddles.set(channelId, set);
+  if (action === 'join') {
+    const session = huddleSessions.get(channelId) ?? { startedAt: Date.now(), everyone: new Set<string>() };
+    session.everyone.add(userId);
+    huddleSessions.set(channelId, session);
+  }
+  if (set.size === 0) endHuddle(channelId);
   broadcast({ t: 'huddles', huddles: huddleList() });
+}
+
+function endHuddle(channelId: string): void {
+  const session = huddleSessions.get(channelId);
+  huddleSessions.delete(channelId);
+  if (!session || !db.channels[channelId]) return;
+  const now = Date.now();
+  if (now - session.startedAt < 30_000) return;
+  postMessage(channelId, BOT_ID, huddleNote(channelId, session.startedAt, now, [...session.everyone], db.messages, db.users), { system: true });
 }
 
 function openDM(a: string, b: string): Channel {
@@ -483,6 +807,8 @@ setInterval(() => {
   }
   persist();
 }, 1000);
+
+setInterval(applyRetention, 60 * 60_000);
 
 const mime: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -533,7 +859,7 @@ wss.on('connection', (ws) => {
     const uid = clients.get(ws);
     clients.delete(ws);
     if (uid && !onlineIds().includes(uid)) {
-      for (const [cid, set] of huddles) if (set.delete(uid)) huddles.set(cid, set);
+      for (const [cid, set] of huddles) if (set.delete(uid) && set.size === 0) endHuddle(cid);
       broadcast({ t: 'huddles', huddles: huddleList() });
     }
     broadcast({ t: 'presence', online: onlineIds() });

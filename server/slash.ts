@@ -3,6 +3,8 @@ export type Slash =
   | { kind: 'topic'; text: string }
   | { kind: 'huddle' }
   | { kind: 'summarize' }
+  | { kind: 'recap' }
+  | { kind: 'explain'; term: string }
   | { kind: 'say'; text: string }
   | { kind: 'usage'; text: string };
 
@@ -27,6 +29,10 @@ export function parseSlash(input: string): Slash | null {
       return { kind: 'huddle' };
     case 'summarize':
       return { kind: 'summarize' };
+    case 'recap':
+      return { kind: 'recap' };
+    case 'explain':
+      return arg ? { kind: 'explain', term: arg } : { kind: 'usage', text: 'Usage: /explain <term>' };
     case 'shrug':
       return { kind: 'say', text: `${arg} ¯\\_(ツ)_/¯`.trim() };
     case 'me':

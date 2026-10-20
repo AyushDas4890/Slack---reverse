@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { ClientEvent, Snapshot } from './types.ts';
+import type { Analytics, ClientEvent, Snapshot } from './types.ts';
 
 export interface RelayCtx {
   snap: Snapshot;
@@ -7,6 +7,7 @@ export interface RelayCtx {
   typing: Record<string, Record<string, number>>;
   openThread: (id: string | null) => void;
   openChannel: (id: string) => void;
+  analytics: Analytics | null;
 }
 
 export const Ctx = createContext<RelayCtx | null>(null);

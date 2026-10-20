@@ -5,6 +5,10 @@ import { EMOJI } from '../format.tsx';
 
 const MAX_FILE = 4 * 1024 * 1024;
 
+function readBlob(blob: Blob, name: string): Promise<FileAttachment> {
+  return readFile(new File([blob], name, { type: blob.type }));
+}
+
 function readFile(file: File): Promise<FileAttachment> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -30,6 +34,8 @@ export function Composer({
   const [files, setFiles] = useState<FileAttachment[]>([]);
   const [picker, setPicker] = useState(false);
   const [fileError, setFileError] = useState('');
+  const [recording, setRecording] = useState<null | 'audio' | 'screen'>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
   const lastTyping = useRef(0);
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -37,9 +43,46 @@ export function Composer({
   const mentionMatches =
     mentionQuery === undefined
       ? []
-      : Object.values(snap.users)
-          .filter((u) => u.name.toLowerCase().includes(mentionQuery.toLowerCase()))
-          .slice(0, 5);
+      : [
+          ...snap.groups
+            .filter((g) => g.handle.includes(mentionQuery.toLowerCase()))
+            .map((g) => ({ key: g.id, label: `@${g.handle} · ${g.members.length} people`, token: `<!g:${g.id}>` })),
+          ...Object.values(snap.users)
+            .filter((u) => u.name.toLowerCase().includes(mentionQuery.toLowerCase()))
+            .map((u) => ({ key: u.id, label: `@${u.name}`, token: `<@${u.id}>` })),
+        ].slice(0, 6);
+
+  const startClip = async (kind: 'audio' | 'screen') => {
+    setFileError('');
+    let stream: MediaStream;
+    try {
+      stream = kind === 'audio'
+        ? await navigator.mediaDevices.getUserMedia({ audio: true })
+        : await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    } catch (err) {
+      setFileError(`Can't record: ${(err as Error).message}`);
+      return;
+    }
+    const chunks: Blob[] = [];
+    const recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = (e) => chunks.push(e.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      setRecording(null);
+      const blob = new Blob(chunks, { type: recorder.mimeType });
+      if (blob.size > MAX_FILE) {
+        setFileError('Clip is over 4 MB. Record a shorter one.');
+        return;
+      }
+      const clip = await readBlob(blob, `${kind}-clip-${Date.now()}.webm`);
+      setFiles((prev) => [...prev, clip].slice(0, 5));
+    };
+    // Stopping screen share from the browser bar ends the clip too.
+    stream.getVideoTracks()[0]?.addEventListener('ended', () => recorder.state === 'recording' && recorder.stop());
+    recorderRef.current = recorder;
+    recorder.start();
+    setRecording(kind);
+  };
 
   const submit = () => {
     if (!text.trim() && files.length === 0) return;
@@ -83,15 +126,15 @@ export function Composer({
     <div className="composer">
       {mentionMatches.length > 0 && (
         <div className="popover mention-pop">
-          {mentionMatches.map((u) => (
+          {mentionMatches.map((x) => (
             <button
-              key={u.id}
+              key={x.key}
               onClick={() => {
-                setText(text.replace(/@\w*$/, `<@${u.id}> `));
+                setText(text.replace(/@\w*$/, `${x.token} `));
                 ref.current?.focus();
               }}
             >
-              @{u.name}
+              {x.label}
             </button>
           ))}
         </div>
@@ -136,6 +179,14 @@ export function Composer({
           </label>
           <button className="icon-btn" title="Emoji" onClick={() => setPicker(!picker)}>☺</button>
           <button className="icon-btn" title="Mention" onClick={() => setText(text + '@')}>@</button>
+          {recording ? (
+            <button className="ghost-btn danger" onClick={() => recorderRef.current?.stop()}>⏹ Stop {recording} clip</button>
+          ) : (
+            <>
+              <button className="icon-btn" title="Record audio clip" onClick={() => void startClip('audio')}>🎙</button>
+              <button className="icon-btn" title="Record screen clip" onClick={() => void startClip('screen')}>🎬</button>
+            </>
+          )}
           <span className="spacer" />
           {onSchedule && (
             <button className="ghost-btn" disabled={!text.trim()} onClick={() => { onSchedule(text); setText(''); }}>
